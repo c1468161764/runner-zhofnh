@@ -1,0 +1,587 @@
+# 构建执行器（公开仓库专用）
+#
+# 本仓库只承担「运行 macOS runner」这一个职责，不含任何业务代码、第三方 SDK
+# 或证书信息。构建所需的全部脚本、配置、资源都由私有仓库在运行时拉取：
+#
+#   1) git clone 私有仓库 -> ios-ci/（脚本 + app-config.json + vendor 插件）
+#   2) gh release download 私有仓库 assets-v1 -> SDK 分片 / app-plus / 图标
+#   3) 构建完成后把签名 IPA 回传到私有仓库 builds Release，不留在本仓库
+#
+# secrets 全部写在公开仓库（fork PR 读不到，且本 workflow 只允许手动触发）：
+#   PRIVATE_REPO         私有仓库，格式 owner/name
+#   PRIVATE_REPO_TOKEN   classic PAT，repo scope（读私有代码 + 写私有 Release）
+#   IOS_CERT_P12_BASE64 / IOS_CERT_PASSWORD / IOS_PROFILE_BASE64 / KEYCHAIN_PASSWORD
+#   UNI_APP_ID / APP_NAME / BUNDLE_ID / TEAM_ID / PROFILE_NAME / IOS_DCLOUD_APPKEY
+#
+# 日志里不打印 Bundle ID、Team ID、证书主体、AppKey、profile 名等任何标识，
+# 断言失败只报「哪一项不对」，不回显实际值。
+
+name: ios-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: "CFBundleShortVersionString，如 3.0.3"
+        required: true
+        default: "3.0.3"
+      build_number:
+        description: "CFBundleVersion，必须严格递增"
+        required: true
+      signing_mode:
+        description: "dev = 开发证书（装注册设备）；appstore = Apple Distribution（上架/TestFlight）"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - appstore
+      profile_name:
+        description: "描述文件 Name（留空则用 secrets.PROFILE_NAME）"
+        required: false
+        default: ""
+
+# 只允许手动触发：公开仓库的 push 触发对任何人都开放，避免被外部刷构建
+# （虽不烧额度，但会占并发、污染 run 列表）。
+
+# macOS runner 额度紧张（私有仓库按 10 倍计费），避免 dispatch 与 tag 构建互相取消
+concurrency:
+  group: ios-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 全部走 secrets：workflow 文件是公开的，任何标识都不能写在这里。
+  UNI_APP_ID: ${{ secrets.UNI_APP_ID }}
+  APP_NAME: ${{ secrets.APP_NAME }}
+  BUNDLE_ID: ${{ secrets.BUNDLE_ID }}
+  TEAM_ID: ${{ secrets.TEAM_ID }}
+  # 签名模式由 dispatch 入参 signing_mode 决定（打包工作台会传）：
+  #   dev      -> Apple Development + dev profile，Development IPA（注册设备可装）
+  #   appstore -> Apple Distribution + 分发 profile，可上架 / TestFlight
+  PROFILE_NAME: ${{ inputs.profile_name || secrets.PROFILE_NAME }}
+  SIGN_CERT: ${{ inputs.signing_mode == 'appstore' && 'Apple Distribution' || 'Apple Development' }}
+  EXPORT_METHOD: ${{ inputs.signing_mode == 'appstore' && 'app-store-connect' || 'development' }}
+  # 5.26 zip 解压后：shell/SDK/HBuilder-Hello/HBuilder-Hello.xcodeproj
+  # pod install 后同名 .xcworkspace 会生成在同一目录
+  SHELL_DIR: shell/SDK/HBuilder-Hello
+  # 5.26 工程里没有共享 xcscheme，Xcode 自动创建的 scheme 名 = target 名
+  # CocoaPods 步骤还会再自动探测一次并覆盖这里
+  SCHEME: HBuilder
+
+jobs:
+  build:
+    runs-on: macos-15
+    # macOS runner 按 10 倍计费：卡死到超时一次就要烧 900 分钟（Free 额度的 45%）。
+    # 实测正常构建 3 分钟、历史最长 13 分钟，30 分钟已留 2 倍余量。
+    # 单步另设更短超时，让 curl / xcodebuild 卡住时尽早失败而不是拖到 job 级超时。
+    timeout-minutes: 30
+    # 公开仓库自身不需要写权限；私有 Release 的读由 PRIVATE_REPO_TOKEN 提供
+    permissions:
+      contents: read
+
+    steps:
+      # 本仓库刻意不存任何构建脚本：业务配置、插件、签名参数都在私有仓库。
+      # 每次构建时拉一份最新的进来，保证「源头单点」——改脚本只改私有仓库一处。
+      - name: 载入私有构建脚本与配置
+        env:
+          PRIV: ${{ secrets.PRIVATE_REPO }}
+          TOK: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$PRIV" && test -n "$TOK" || {
+            echo "::error::缺 PRIVATE_REPO / PRIVATE_REPO_TOKEN"; exit 1; }
+          git clone --depth 1 --quiet \
+            "https://x-access-token:${TOK}@github.com/${PRIV}.git" .priv
+          rm -rf .priv/.git
+          mkdir -p ios-ci
+          cp -R .priv/ios-ci/. ios-ci/
+          # 私有仓库正常不含密钥文件（.gitignore 已排除）；万一有也不留在 runner
+          rm -f ios-ci/.secrets.env ios-ci/.secrets.dist.env
+          rm -rf .priv
+          echo "构建脚本已载入"
+
+      - name: 固定 Xcode 版本
+        run: |
+          set -euo pipefail
+          echo "--- runner 上可用 Xcode ---"
+          ls -d /Applications/Xcode_*.app 2>/dev/null || true
+          # 5.26 离线 SDK 里的 UTS framework（uniGetLocationTencentUni1 等）由
+          # Swift 6.2 / iOS 26 SDK 编译。Xcode 16.4（iOS 18.5 SDK）链接时缺
+          # _swift_coroFrameAlloc、swift_DarwinFoundation1~3、SwiftUICore，
+          # 实测 ARCHIVE FAILED / clang: error: linker command failed with exit code 1。
+          # 必须用 Xcode 26.x，且保留全部 subspecs（不动业务能力）。
+          XCODE=""
+          for C in Xcode_26.2.app Xcode_26.3.app Xcode_26.1.1.app Xcode_26.0.1.app; do
+            if [ -d "/Applications/$C" ]; then XCODE="/Applications/$C"; break; fi
+          done
+          if [ -z "$XCODE" ]; then
+            echo "::error::runner 上没有 Xcode 26.x，5.26 SDK 的 Swift UTS 库无法链接"
+            exit 1
+          fi
+          sudo xcode-select -s "${XCODE}"
+          echo "已选择 ${XCODE}"
+          # 5.26 的 pbxproj 在两处 HEADER_SEARCH_PATHS 里硬编码了
+          #   /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include
+          # 而 runner 上 Xcode.app 默认指向 16.4。只改 xcode-select 会造成
+          # 26.2 的 Swift 模块 + 16.4 的 modulemap 混用，报
+          # "Redefinition of module 'SwiftBridging'" 和一堆
+          # "Unable to find module dependency: 'Foundation'/'SwiftUI'"。
+          # 把默认 symlink 一并对齐到所选 Xcode，工程文件一个字都不用改。
+          sudo ln -sfn "${XCODE}" /Applications/Xcode.app
+          echo "Xcode.app -> $(readlink /Applications/Xcode.app)"
+          xcodebuild -version
+
+      - name: 计算版本号
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "build=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.marketing_version }}" >> "$GITHUB_OUTPUT"
+            echo "build=${{ inputs.build_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- 0. 大文件资产 ----------
+      # 657MB SDK、app-plus 业务资源、图标包都在**私有仓库**的 Release 里，
+      # 本仓库只借 runner 的算力，不搬运也不留存这些文件。
+      # SDK 被切成 48MB 分片（ios-SDK.zip.partNNN），逐个下载更稳，按顺序合并。
+      - name: 下载构建资产（私有 Release）
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          PRIV: ${{ secrets.PRIVATE_REPO }}
+          ASSET_TAG: ${{ vars.IOS_ASSET_TAG || 'assets-v1' }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assets
+          if ! gh release view "$ASSET_TAG" -R "$PRIV" >/dev/null 2>&1; then
+            echo "::notice::私有仓库没有 $ASSET_TAG Release，改用 IOS_SDK_URL / APP_PLUS_URL 外部直链"
+            exit 0
+          fi
+          gh release download "$ASSET_TAG" -R "$PRIV" \
+            -D /tmp/assets -p 'ios-SDK.zip.part*' -p 'app-plus-*.zip' -p 'ios-SDK.zip' -p 'ios-icons.zip'
+          ls -lh /tmp/assets
+          if ls /tmp/assets/ios-SDK.zip.part* >/dev/null 2>&1; then
+            # 分片名零填充，shell 通配符展开即自然有序
+            PARTS=(/tmp/assets/ios-SDK.zip.part*)
+            echo "分片数: ${#PARTS[@]}"
+            # 踩过的坑：Release 里 state=starter 的占位资产会被 gh 静默跳过，
+            # 合并后缺整整 48MB，unzip 报 invalid compressed data / exit 2。
+            test "${#PARTS[@]}" -eq 14 || {
+              echo "::error::SDK 分片应为 14 个，实际 ${#PARTS[@]} 个"; ls -l /tmp/assets; exit 1; }
+            cat "${PARTS[@]}" > /tmp/assets/sdk.zip
+            ACTUAL=$(stat -f%z /tmp/assets/sdk.zip)
+            test "$ACTUAL" -eq 688981404 || {
+              echo "::error::合并后 SDK 大小 $ACTUAL != 688981404，分片不完整"; exit 1; }
+            SDK_SHA=$(shasum -a 256 /tmp/assets/sdk.zip | awk '{print $1}')
+            test "$SDK_SHA" = "8c76179b083ae40eef5e01d70fd7e69cc173165266547e3606d4648d95cc17b2" || {
+              echo "::error::SDK SHA256 不匹配，资产内容有误: $SDK_SHA"; exit 1; }
+            echo "SDK 完整性校验通过 (688981404 B)"
+            echo "SDK_ZIP=/tmp/assets/sdk.zip" >> "$GITHUB_ENV"
+          elif [ -f /tmp/assets/ios-SDK.zip ]; then
+            echo "SDK_ZIP=/tmp/assets/ios-SDK.zip" >> "$GITHUB_ENV"
+          fi
+          AP=$(ls /tmp/assets/app-plus-*.zip 2>/dev/null | head -n1 || true)
+          if [ -n "$AP" ]; then
+            echo "APP_PLUS_ZIP=$AP" >> "$GITHUB_ENV"
+          fi
+
+      # ---------- 1. 前端资源 ----------
+      # 重要：GPP-New-Customer-APP 是 HBuilderX 项目，package.json 里没有构建脚本，
+      # 不能 npm run build。app-plus 资源必须由 HBuilderX 本地「发行 -> 原生App本地打包」
+      # 生成（unpackage/dist/build/app-plus，当前 240 个文件），再提交到仓库或上传私有存储。
+      - name: 准备 app-plus 资源
+        env:
+          APP_PLUS_URL: ${{ secrets.APP_PLUS_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APP_PLUS_ZIP:-}" ] && [ -f "$APP_PLUS_ZIP" ]; then
+            echo "使用私有 Release 资产里的 app-plus 包: $APP_PLUS_ZIP"
+            mkdir -p dist
+            unzip -q "$APP_PLUS_ZIP" -d dist
+          elif [ -d "app-plus" ]; then
+            echo "使用仓库内已提交的 app-plus/"
+            mkdir -p dist
+            cp -R app-plus dist/app-plus
+          elif [ -n "$APP_PLUS_URL" ]; then
+            curl -fL --retry 3 -o /tmp/app-plus.zip "$APP_PLUS_URL"
+            mkdir -p dist && unzip -q /tmp/app-plus.zip -d dist
+            # 兼容「zip 根就是 app-plus」「zip 里带 unpackage/dist/build/app-plus」两种结构
+            if [ ! -d dist/app-plus ]; then
+              SRC=$(find dist -type d -name app-plus | head -n1)
+              test -n "$SRC" || { echo "app-plus 资源包结构不对"; find dist -maxdepth 4 | head -30; exit 1; }
+              cp -R "$SRC" dist/app-plus
+            fi
+          else
+            echo "::error::缺少 app-plus 资源：请提交 app-plus/ 目录，或配置 secret APP_PLUS_URL"
+            exit 1
+          fi
+          test -f dist/app-plus/manifest.json || { echo "缺 manifest.json"; exit 1; }
+          # 版本对齐：拒绝把 5.34 编译的资源塞进 5.26 SDK
+          grep -q '"compilerVersion"[[:space:]]*:[[:space:]]*"5.26"' dist/app-plus/manifest.json \
+            || { echo "::error::compilerVersion 不是 5.26，与离线 SDK 版本不匹配"; exit 1; }
+          echo "APP_RES=$PWD/dist/app-plus" >> "$GITHUB_ENV"
+          du -sh dist/app-plus
+
+      # ---------- 2. 拉壳工程 ----------
+      - name: 下载 iOS 离线 SDK 5.26
+        timeout-minutes: 12
+        env:
+          SDK_URL: ${{ secrets.IOS_SDK_URL }}
+          SDK_TOKEN: ${{ secrets.IOS_SDK_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SDK_ZIP:-}" ] && [ -f "$SDK_ZIP" ]; then
+            echo "使用私有 Release 资产里的 SDK: $SDK_ZIP"
+          else
+            test -n "$SDK_URL" || {
+              echo "::error::缺 SDK：请上传 assets-v1 Release，或配置 secret IOS_SDK_URL"; exit 1; }
+            if [ -n "$SDK_TOKEN" ]; then
+              curl -fL --retry 3 --retry-delay 5 \
+                -H "Authorization: Bearer $SDK_TOKEN" \
+                -o /tmp/sdk.zip "$SDK_URL"
+            else
+              curl -fL --retry 3 --retry-delay 5 \
+                -o /tmp/sdk.zip "$SDK_URL"
+            fi
+            SDK_ZIP=/tmp/sdk.zip
+          fi
+          # 657MB / 688981404 字节，5.26 包；不做严格大小校验，避免官方重打包后误报
+          unzip -q "$SDK_ZIP" -d shell
+          # 官方 zip 带 6682 个 __MACOSX / ._ AppleDouble 条目，会污染 Xcode 工程
+          find shell -name '__MACOSX' -type d -prune -exec rm -rf {} +
+          find shell -name '._*' -type f -delete
+          grep -q "s.version = '5.26.0'" shell/SDK/uniapp.podspec \
+            || { echo "::error::离线 SDK 版本不是 5.26.0，请检查 IOS_SDK_URL"; exit 1; }
+          test -d "$SHELL_DIR" || { echo "找不到 $SHELL_DIR"; find shell -maxdepth 3 | head -30; exit 1; }
+          echo "--- 找到的工程 ---"
+          find shell -maxdepth 4 \( -name "*.xcworkspace" -o -name "*.xcodeproj" \) | head -20
+
+      - name: 注入 www 资源、AppKey 与插件注册
+        env:
+          IOS_APPKEY: ${{ secrets.IOS_DCLOUD_APPKEY }}
+        run: |
+          set -euo pipefail
+          test -f ios-ci/app-config.json || {
+            echo "::error::缺 ios-ci/app-config.json，先在本地跑 python ios-ci/prepare-ios.py 并提交"; exit 1; }
+
+          RES="$SHELL_DIR/HBuilder-Hello"   # 工程资源根（control.xml / Pandora / Info.plist）
+          APPS_DIR="$RES/Pandora/apps"
+          test -d "$APPS_DIR" || { echo "没找到 $APPS_DIR"; exit 1; }
+
+          # ① 清掉官方示例 app，只留我们自己的
+          find "$APPS_DIR" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+          APP_DIR="$APPS_DIR/$UNI_APP_ID"
+          mkdir -p "$APP_DIR/www"
+          cp -R "$APP_RES"/. "$APP_DIR/www/"
+
+          # ② control.xml：5.26 用「属性」而不是 <appid> 标签；文件必须留在工程资源根
+          CTRL="$RES/control.xml"
+          sed -i '' \
+            -e "s|appid=\"[^\"]*\"|appid=\"$UNI_APP_ID\"|" \
+            -e "s|appver=\"[^\"]*\"|appver=\"${{ steps.ver.outputs.version }}\"|" \
+            -e 's|debug="true"|debug="false"|' \
+            "$CTRL"
+          grep -q "appid=\"$UNI_APP_ID\"" "$CTRL" || { echo "::error::control.xml 替换失败"; exit 1; }
+          echo "control.xml 已更新（appid / appver / debug=false）"
+
+          # ③ Info.plist：AppKey + dcloud_uniplugins + URL schemes + 权限文案 + 微信参数
+          #    AppKey 优先用 secret，没配就用 app-config.json 里从项目提取的 iOS 平台值
+          python3 ios-ci/inject-plist.py "$RES/HBuilder-Hello-Info.plist" \
+            --config ios-ci/app-config.json \
+            --version "${{ steps.ver.outputs.version }}" \
+            --build "${{ steps.ver.outputs.build }}"
+
+          # ④ App 图标：5.26 壳工程里 AppIcon.appiconset 是空目录、CFBundleIcons={}，
+          #    不替换的话打出来的包没有桌面图标（实测 IPA 里连 Assets.car 都没有）。
+          #    ios-icons.zip 由项目 unpackage/res/icons 的全套尺寸图生成。
+          ICONS_ZIP=/tmp/assets/ios-icons.zip
+          test -f "$ICONS_ZIP" || { echo "::error::缺 ios-icons.zip，App 图标不会进包"; exit 1; }
+          ASSETS="$SHELL_DIR/HBuilder/Images.xcassets"
+          mkdir -p "$ASSETS/AppIcon.appiconset"
+          # 只解 AppIcon，launch-logo.png 留在 /tmp/assets 给启动屏用
+          unzip -qo "$ICONS_ZIP" 'AppIcon.appiconset/*' -d "$ASSETS"
+          test -f "$ASSETS/AppIcon.appiconset/Contents.json" || {
+            echo "::error::AppIcon.appiconset 缺 Contents.json"; exit 1; }
+          ICON_COUNT=$(ls -1 "$ASSETS/AppIcon.appiconset"/*.png | wc -l | tr -d ' ')
+          test "$ICON_COUNT" -ge 10 || { echo "::error::AppIcon 图标文件不足: $ICON_COUNT"; exit 1; }
+          echo "AppIcon 已替换: $ICON_COUNT 张（项目 unpackage/res/icons）"
+
+          # ⑤ 启动屏：5.26 壳工程的 LaunchScreen.storyboard 写死了
+          #    image="app" + text="HBuilder Hello"，不替换的话冷启动第一屏
+          #    还是 HBuilderX 的 logo 和名字。这里换成项目自己的品牌图 + 应用名。
+          test -f "$ICONS_ZIP" || { echo "::error::缺 ios-icons.zip"; exit 1; }
+          unzip -qo "$ICONS_ZIP" launch-logo.png -d /tmp/assets || true
+          LOGO=/tmp/assets/launch-logo.png
+          test -f "$LOGO" || { echo "::error::图标包里缺 launch-logo.png"; exit 1; }
+          python3 ios-ci/fix-launchscreen.py \
+            --shell-dir "$SHELL_DIR" \
+            --app-name "$APP_NAME" \
+            --logo "$LOGO"
+
+          # 兜底校验：storyboard 里不能再出现 HBuilderX 品牌
+          if grep -rIlE "HBuilder Hello|dclogo" "$SHELL_DIR" --include="*.storyboard" 2>/dev/null; then
+            echo "::error::启动屏仍残留 HBuilderX 品牌"; exit 1
+          fi
+          grep -q "$APP_NAME" "$SHELL_DIR/HBuilder-Hello/Base.lproj/LaunchScreen.storyboard" \
+            || { echo "::error::启动屏未写入应用名 $APP_NAME"; exit 1; }
+          echo "启动屏已替换为 $APP_NAME"
+
+          test -f "$APP_DIR/www/manifest.json" || { echo "::error::www 资源没拷进去"; exit 1; }
+          echo "前端资源已注入"
+
+      - name: 集成原生插件与 Pod 模块
+        run: |
+          set -euo pipefail
+          # 不在 workflow 里写插件目录名，避免公开第三方 SDK 的厂商信息；
+          # 私有仓库 ios-ci/vendor/ 下按项目只有一个插件目录。
+          VENDOR=$(ls -d ios-ci/vendor/*/ 2>/dev/null | head -n1)
+          test -n "$VENDOR" || { echo "::error::私有仓库缺 ios-ci/vendor/ 插件目录"; exit 1; }
+          python3 ios-ci/make-plugin-pod.py \
+            --shell-dir "$SHELL_DIR" \
+            --vendor "${VENDOR%/}" \
+            --config ios-ci/app-config.json \
+            --entitlements ios-ci/GPP.entitlements
+
+      - name: CocoaPods
+        run: |
+          set -euo pipefail
+          test -f "$SHELL_DIR/Podfile" || { echo "缺 Podfile"; exit 1; }
+          cd "$SHELL_DIR"
+          # Podfile 里 require_relative 'scripts/uniapp_module_config'，解压目录必须完整
+          # 只跑一次，且禁止 repo update。Podfile 的 spec repo 已由
+          # make-plugin-pod.py 精简为 CDN（见该脚本 3c），不再 clone git 仓库。
+          # 旧写法 `|| pod install --repo-update` 一旦首次因别的原因失败，
+          # 会静默触发全量 spec repo 更新，额外多花十几分钟且掩盖真实错误。
+          pod install --no-repo-update
+          grep -q "CPCNPayPlugin" Podfile.lock || {
+            echo "::error::CPCNPayPlugin 没进 Podfile.lock，插件不会链接进包"; exit 1; }
+          # 5.26 工程没有 xcshareddata/xcschemes，Xcode 自动创建的 scheme 名 = target 名。
+          # 实测 target 是 HBuilder（productName 才是 HBuilder-Hello），硬编码容易踩空，
+          # 这里直接探测并覆盖 job env 里的 SCHEME。
+          echo "--- 自动探测 scheme ---"
+          xcodebuild -list -workspace HBuilder-Hello.xcworkspace -json > /tmp/schemes.json
+          # 实测 workspace 有 3 个 scheme：CPCNPayPlugin / HBuilder / Pods-HBuilder。
+          # 取第一个会误选插件 scheme（归档必失败），这里锁定 SDK target 名 HBuilder。
+          DETECTED=$(python3 -c "import json; d=json.load(open('/tmp/schemes.json')); s=((d.get('workspace') or d.get('project') or {}).get('schemes') or []); print('HBuilder' if 'HBuilder' in s else next((x for x in s if not x.startswith('Pods-') and not x.startswith('CPCN')), (s or [''])[0]))")
+          test -n "$DETECTED" || { echo "::error::xcodebuild -list 没列出 scheme"; cat /tmp/schemes.json; exit 1; }
+          test "$DETECTED" = "HBuilder" || {
+            echo "::error::没找到 HBuilder scheme，实际探测到: ${DETECTED}"; cat /tmp/schemes.json; exit 1; }
+          echo "检测到 scheme: ${DETECTED}（job env 默认 ${SCHEME}）"
+          echo "SCHEME=$DETECTED" >> "$GITHUB_ENV"
+          xcodebuild -list -workspace HBuilder-Hello.xcworkspace 2>/dev/null | head -30 || true
+
+      # ---------- 3. 签名凭据 ----------
+      - name: 装入证书与描述文件
+        env:
+          CERT_B64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.IOS_CERT_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_PROFILE_BASE64 }}
+          KEYCHAIN_PW: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$CERT_B64" && test -n "$PROFILE_B64" || {
+            echo "::error::缺 IOS_CERT_P12_BASE64 / IOS_PROFILE_BASE64"; exit 1; }
+
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 1800 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+
+          echo "$CERT_B64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PW" -T /usr/bin/codesign -T /usr/bin/security
+          # 不加这句会报 errSecInternalComponent / User interaction is not allowed
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" > /dev/null
+
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+
+          # 文件名必须是 profile 内部 UUID，Xcode 按 UUID 索引。
+          # dev / 分发两套 profile 的 UUID 不同，从描述文件本身解析，不再依赖写死的 env。
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
+          echo "$PROFILE_B64" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PUUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$PROFILE_DIR/$PUUID.mobileprovision"
+          echo "描述文件已安装（按 UUID 命名）"
+          /usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")" = "$PROFILE_NAME" || {
+            echo "::error::profile 名称与 PROFILE_NAME 不一致，检查 secret 是否传错文件"; exit 1; }
+          test "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")" \
+            = "$TEAM_ID.$BUNDLE_ID" || {
+            echo "::error::profile 的 application-identifier 与 TEAM_ID/BUNDLE_ID 不匹配"; exit 1; }
+
+          echo "--- 可用签名身份 ---"
+          # 证书主体含姓名/Team 缩写，只在内部判断，不回显
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -qF "$SIGN_CERT" || {
+            echo "::error::钥匙串里找不到 ${SIGN_CERT}，检查 p12 与密码"; exit 1; }
+
+      - name: 配置手动签名（只在 runner 上改工程）
+        # 参考 flutter 项目：把签名设置写进 target 的 build settings，archive 命令行不传
+        # PROVISIONING_PROFILE_SPECIFIER —— 命令行传会连带要求 Pods / SwiftPM 依赖一起签名。
+        run: |
+          set -euo pipefail
+          python3 ios-ci/configure-signing.py \
+            --pbxproj "$SHELL_DIR/HBuilder-Hello.xcodeproj/project.pbxproj" \
+            --shell-dir "$SHELL_DIR" \
+            --team "$TEAM_ID" \
+            --bundle "$BUNDLE_ID" \
+            --profile "$PROFILE_NAME" \
+            --cert "$SIGN_CERT" \
+            --entitlements "HBuilder-Hello/GPP.entitlements"
+
+      # ---------- 4. 打包 ----------
+      - name: Archive
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -workspace "$SHELL_DIR/HBuilder-Hello.xcworkspace" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            MARKETING_VERSION="${{ steps.ver.outputs.version }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}"
+
+      - name: 导出 ipa
+        run: |
+          set -euo pipefail
+          # 用 PlistBuddy 按 env 覆盖，不用 sed 匹配占位符（换证书时不会漏改）
+          cp ios-ci/ExportOptions.plist "$RUNNER_TEMP/ExportOptions.plist"
+          PLIST="$RUNNER_TEMP/ExportOptions.plist"
+          PB="/usr/libexec/PlistBuddy"
+          "$PB" -c "Set :teamID $TEAM_ID" "$PLIST"
+          "$PB" -c "Set :method $EXPORT_METHOD" "$PLIST"
+          "$PB" -c "Set :signingCertificate $SIGN_CERT" "$PLIST"
+          "$PB" -c "Remove :provisioningProfiles" "$PLIST" 2>/dev/null || true
+          "$PB" -c "Add :provisioningProfiles dict" "$PLIST"
+          "$PB" -c "Add :provisioningProfiles:$BUNDLE_ID string $PROFILE_NAME" "$PLIST"
+          # 只打印导出方式，不 dump 整个 plist（含 teamID / Bundle ID / profile 名）
+          echo "导出方式: $("$PB" -c 'Print :method' "$PLIST")"
+
+          # 手动签名 + 本地已装好的 dev profile：不需要 -allowProvisioningUpdates，
+          # 也就完全不需要 ASC API Key（参考 flutter 的 ios-release-dev.yml）
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/out" \
+            -exportOptionsPlist "$PLIST"
+          ls -la "$RUNNER_TEMP/out"
+
+      - name: 校验签名与包内容
+        run: |
+          set -euo pipefail
+          IPA=$(ls "$RUNNER_TEMP"/out/*.ipa | head -n1)
+          echo "IPA 大小: $(du -h "$IPA" | cut -f1)"
+          rm -rf /tmp/ipa_check && unzip -o -q "$IPA" -d /tmp/ipa_check
+          APP=$(find /tmp/ipa_check/Payload -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$APP" || { echo "::error::IPA 里没有 .app"; exit 1; }
+          PB="/usr/libexec/PlistBuddy"
+
+          # codesign -dvv 会输出证书主体（姓名 + Team 缩写）和 TeamIdentifier，
+          # 只做布尔断言，不打印
+          codesign -dvv "$APP" 2>&1 | grep -q "TeamIdentifier=$TEAM_ID" || {
+            echo "::error::TeamIdentifier 不匹配"; exit 1; }
+          echo "签名 Team 校验通过"
+
+          test "$("$PB" -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" = "$BUNDLE_ID" || {
+            echo "::error::Bundle ID 不对"; exit 1; }
+          test "$("$PB" -c 'Print :CFBundleDisplayName' "$APP/Info.plist")" = "$APP_NAME" || {
+            echo "::error::桌面名称不对（与 APP_NAME 不一致）"; exit 1; }
+          test "$("$PB" -c 'Print :CFBundleName' "$APP/Info.plist")" = "$APP_NAME" || {
+            echo "::error::CFBundleName 仍是壳工程默认值"; exit 1; }
+          echo "Bundle ID / 显示名称校验通过"
+
+          # 中文系统桌面名优先读 *.lproj/InfoPlist.strings，壳里是 "HBuilder 你好"。
+          # 只校验 Info.plist 会漏掉这一层（已踩坑），必须逐个 lproj 断言。
+          LPROJ_COUNT=0
+          for F in "$APP"/*.lproj/InfoPlist.strings; do
+            test -f "$F" || continue
+            LPROJ_COUNT=$((LPROJ_COUNT + 1))
+            LNAME=$("$PB" -c 'Print :CFBundleDisplayName' "$F" 2>/dev/null) || LNAME=""
+            test "$LNAME" = "$APP_NAME" || {
+              echo "::error::本地化文件名与 APP_NAME 不一致（$(basename "$(dirname "$F")")）"; exit 1; }
+          done
+          test "$LPROJ_COUNT" -ge 1 || {
+            echo "::error::IPA 里没有 *.lproj/InfoPlist.strings，无法确认本地化名称"; exit 1; }
+          if "$PB" -c 'Print :UIApplicationShortcutItems' "$APP/Info.plist" >/dev/null 2>&1; then
+            echo "::error::仍残留 DCloud 示例的 3D Touch 快捷菜单"; exit 1
+          fi
+          echo "本地化名称已覆盖 $LPROJ_COUNT 个语言，示例快捷菜单已清除"
+
+          V=$("$PB" -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          B=$("$PB" -c 'Print :CFBundleVersion' "$APP/Info.plist")
+          echo "版本: $V ($B)"
+          "$PB" -c 'Print :dcloud_appkey' "$APP/Info.plist" | grep -qE '^[0-9a-f]{32}$' || {
+            echo "::error::dcloud_appkey 缺失或格式不对"; exit 1; }
+          "$PB" -c 'Print :dcloud_uniplugins' "$APP/Info.plist" | grep -q 'cpcn-cpcnpay' || {
+            echo "::error::原生支付插件没注册进 Info.plist"; exit 1; }
+          # Share 模块（libweixinShare.a）从 Info.plist 顶层 weixin.appid 取值，
+          # 缺这个键 plus.share.getServices 里就没有对应服务，跳小程序会失败。
+          "$PB" -c 'Print :weixin:appid' "$APP/Info.plist" | grep -qE '^wx[0-9a-f]{16}$' || {
+            echo "::error::Info.plist 缺 weixin.appid（Share 模块取不到 AppID）"; exit 1; }
+          WXBIN=$(basename "$APP" .app)
+          if nm -gU "$APP/$WXBIN" 2>/dev/null | grep -q '_OBJC_CLASS_\$_WXApi'; then
+            echo "分享 SDK 已链接进二进制"
+          else
+            echo "::warning::二进制里没找到 WXApi 符号，分享/跳小程序可能不可用"
+          fi
+
+          echo "--- 内嵌资源 ---"
+          test -f "$APP/Pandora/apps/$UNI_APP_ID/www/manifest.json" || {
+            echo "::error::www 资源没打进包（热更新资源缺失）"; exit 1; }
+          if [ -s "$APP/Assets.car" ]; then
+            echo "图标资源: Assets.car $(du -h "$APP/Assets.car" | cut -f1)"
+          else
+            echo "::warning::IPA 里没有 Assets.car，桌面图标可能未编译进包，请复核 AppIcon.appiconset"
+          fi
+          test -s "$APP/embedded.mobileprovision" || { echo "::error::缺 embedded.mobileprovision"; exit 1; }
+          security cms -D -i "$APP/embedded.mobileprovision" > /tmp/ipa_check/embedded.plist
+          test "$("$PB" -c 'Print :Entitlements:application-identifier' /tmp/ipa_check/embedded.plist)" \
+            = "$TEAM_ID.$BUNDLE_ID" || { echo "::error::profile 绑定的 App ID 不对"; exit 1; }
+          GTA=$("$PB" -c 'Print :Entitlements:get-task-allow' /tmp/ipa_check/embedded.plist 2>/dev/null || echo false)
+          DEV_COUNT=$(python3 -c "import plistlib; d=plistlib.load(open('/tmp/ipa_check/embedded.plist','rb')); print(len(d.get('ProvisionedDevices') or []))")
+          if [ "$EXPORT_METHOD" = "development" ]; then
+            test "$GTA" = "true" || { echo "::error::dev 包应带 get-task-allow=true"; exit 1; }
+            test "$DEV_COUNT" -gt 0 || { echo "::error::dev 描述文件里没有设备列表"; exit 1; }
+            echo "可安装设备数: ${DEV_COUNT}（Development 包）"
+          else
+            test "$GTA" != "true" || { echo "::error::分发包不该带 get-task-allow=true"; exit 1; }
+            test "$DEV_COUNT" -eq 0 || { echo "::error::分发包不该带设备列表"; exit 1; }
+            echo "分发包：无设备限制（${EXPORT_METHOD}）"
+          fi
+          test "$("$PB" -c 'Print :Name' /tmp/ipa_check/embedded.plist)" = "$PROFILE_NAME" || {
+            echo "::error::包内描述文件与 PROFILE_NAME 不一致"; exit 1; }
+          echo "✅ 签名、Bundle ID、AppKey、插件注册、www 资源、profile 全部通过（${EXPORT_METHOD}）"
+
+      # ---------- 4.5 产物回传 ----------
+      # 公开仓库的 artifact 对任何登录用户可下载，而签名 IPA 里含全部业务资源
+      # （Pandora/apps/*/www），等于把代码公开发出去。所以产物只进私有仓库。
+      - name: 回传 IPA 到私有仓库
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          PRIV: ${{ secrets.PRIVATE_REPO }}
+          V: ${{ steps.ver.outputs.version }}
+          B: ${{ steps.ver.outputs.build }}
+        run: |
+          set -euo pipefail
+          IPA=$(ls "$RUNNER_TEMP"/out/*.ipa | head -n1)
+          gh release view builds -R "$PRIV" >/dev/null 2>&1 || \
+            gh release create builds -R "$PRIV" --title "iOS builds" --notes "自动构建产物" >/dev/null
+          gh release upload builds -R "$PRIV" "$IPA#ios-${V}-${B}.ipa" --clobber
+          for D in "$RUNNER_TEMP"/out/*.dSYM.zip; do
+            [ -f "$D" ] || continue
+            gh release upload builds -R "$PRIV" "$D#dSYM-${V}-${B}.zip" --clobber
+          done
+          echo "产物已归档到私有仓库 builds Release"
+
+      # ---------- 5. 分发 ----------
+      # dev 证书打出的 Development IPA 只能装 profile 里注册的设备，不能上架。
+      # 打包工作台会自动从私有仓库 builds Release 取回 ipa；手动取也可以：
+      #   gh release download builds -R <私有仓库> -p 'ios-*.ipa'
+      # 要正式上架：换 Apple Distribution p12 + 分发 profile，
+      # ExportOptions 的 method 改成 app-store-connect，再补 ASC 上传步骤。
