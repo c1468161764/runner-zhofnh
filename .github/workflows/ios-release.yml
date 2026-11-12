@@ -442,9 +442,11 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          # xcodebuild 会把签名身份（"Apple Development: 姓名 (Team缩写)"）和
-          # TeamIdentifier 打进日志，公开仓库的日志全球可见，先落盘再过滤输出；
-          # 失败时也只回放过滤后的尾部，诊断信息足够但不含证书主体。
+          # xcodebuild 会把签名身份（"Apple Development: 姓名 (Team缩写)"）、
+          # TeamIdentifier，以及 pbxproj / entitlements 里的业务域名和 target 名
+          # 原样打进日志。公开仓库的日志全球可见，先落盘再过滤输出；
+          # 失败时也只回放过滤后的尾部，诊断信息足够但不含这些标识。
+          MASK='Apple Development:|Apple Distribution:|TeamIdentifier=|cpcn|CPCN|gpp2019|jinjiang'
           set +e
           xcodebuild archive \
             -workspace "$SHELL_DIR/HBuilder-Hello.xcworkspace" \
@@ -454,14 +456,12 @@ jobs:
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
             MARKETING_VERSION="${{ steps.ver.outputs.version }}" \
             CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
-            2>&1 | tee "$RUNNER_TEMP/archive.log" \
-                 | grep -vE 'Apple Development:|Apple Distribution:|TeamIdentifier='
+            2>&1 | tee "$RUNNER_TEMP/archive.log" | grep -vE "$MASK"
           RC=${PIPESTATUS[0]}
           set -e
           if [ "$RC" -ne 0 ]; then
-            echo "--- xcodebuild 失败（签名信息已过滤）---"
-            grep -vE 'Apple Development:|Apple Distribution:|TeamIdentifier=' \
-              "$RUNNER_TEMP/archive.log" | tail -60
+            echo "--- xcodebuild 失败（签名与业务标识已过滤）---"
+            grep -vE "$MASK" "$RUNNER_TEMP/archive.log" | tail -60
             exit "$RC"
           fi
 
