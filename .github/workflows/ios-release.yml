@@ -358,8 +358,8 @@ jobs:
           # 旧写法 `|| pod install --repo-update` 一旦首次因别的原因失败，
           # 会静默触发全量 spec repo 更新，额外多花十几分钟且掩盖真实错误。
           pod install --no-repo-update
-          grep -q "CPCNPayPlugin" Podfile.lock || {
-            echo "::error::CPCNPayPlugin 没进 Podfile.lock，插件不会链接进包"; exit 1; }
+          grep -q "Plugins/" Podfile.lock || {
+            echo "::error::本地 path 引入的原生插件没进 Podfile.lock，不会链接进包"; exit 1; }
           # 5.26 工程没有 xcshareddata/xcschemes，Xcode 自动创建的 scheme 名 = target 名。
           # 实测 target 是 HBuilder（productName 才是 HBuilder-Hello），硬编码容易踩空，
           # 这里直接探测并覆盖 job env 里的 SCHEME。
@@ -440,13 +440,15 @@ jobs:
       # ---------- 4. 打包 ----------
       - name: Archive
         timeout-minutes: 20
+        env:
+          # 打码词表放 secret，避免它自己出现在日志的命令回显里
+          MASK: ${{ secrets.LOG_MASK }}
         run: |
           set -euo pipefail
           # xcodebuild 会把签名身份（"Apple Development: 姓名 (Team缩写)"）、
           # TeamIdentifier，以及 pbxproj / entitlements 里的业务域名和 target 名
-          # 原样打进日志。公开仓库的日志全球可见，先落盘再过滤输出；
-          # 失败时也只回放过滤后的尾部，诊断信息足够但不含这些标识。
-          MASK='Apple Development:|Apple Distribution:|TeamIdentifier=|cpcn|CPCN|gpp2019|jinjiang'
+          # 原样打进日志。公开仓库的日志全球可见，所以整段收进文件：
+          # 成功不输出，失败时按 LOG_MASK 打码后再回放尾部。
           set +e
           xcodebuild archive \
             -workspace "$SHELL_DIR/HBuilder-Hello.xcworkspace" \
@@ -456,14 +458,19 @@ jobs:
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
             MARKETING_VERSION="${{ steps.ver.outputs.version }}" \
             CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
-            2>&1 | tee "$RUNNER_TEMP/archive.log" | grep -vE "$MASK"
-          RC=${PIPESTATUS[0]}
+            > "$RUNNER_TEMP/archive.log" 2>&1
+          RC=$?
           set -e
           if [ "$RC" -ne 0 ]; then
-            echo "--- xcodebuild 失败（签名与业务标识已过滤）---"
-            grep -vE "$MASK" "$RUNNER_TEMP/archive.log" | tail -60
+            echo "--- xcodebuild 失败（已按 LOG_MASK 打码）---"
+            if [ -n "${MASK:-}" ]; then
+              tail -80 "$RUNNER_TEMP/archive.log" | sed -E "s#($MASK)#***#g"
+            else
+              tail -80 "$RUNNER_TEMP/archive.log"
+            fi
             exit "$RC"
           fi
+          echo "Archive 完成（xcodebuild 原始日志已留存，不输出）"
 
       - name: 导出 ipa
         run: |
@@ -535,7 +542,10 @@ jobs:
           echo "版本: $V ($B)"
           "$PB" -c 'Print :dcloud_appkey' "$APP/Info.plist" | grep -qE '^[0-9a-f]{32}$' || {
             echo "::error::dcloud_appkey 缺失或格式不对"; exit 1; }
-          "$PB" -c 'Print :dcloud_uniplugins' "$APP/Info.plist" | grep -q 'cpcn-cpcnpay' || {
+          # 插件 id 从私有配置读，不写死在公开的 workflow 里
+          PLUGIN_ID=$(python3 -c "import json;print((json.load(open('ios-ci/app-config.json')).get('plugin') or {}).get('id',''))")
+          test -n "$PLUGIN_ID" || { echo "::error::app-config.json 里没有插件 id"; exit 1; }
+          "$PB" -c 'Print :dcloud_uniplugins' "$APP/Info.plist" | grep -q "$PLUGIN_ID" || {
             echo "::error::原生支付插件没注册进 Info.plist"; exit 1; }
           # Share 模块（libweixinShare.a）从 Info.plist 顶层 weixin.appid 取值，
           # 缺这个键 plus.share.getServices 里就没有对应服务，跳小程序会失败。
