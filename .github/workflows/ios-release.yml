@@ -597,14 +597,20 @@ jobs:
         run: |
           set -euo pipefail
           IPA=$(ls "$RUNNER_TEMP"/out/*.ipa | head -n1)
+          # 不要依赖 `gh release upload` 的 path#name 重命名语法（实测在 runner 上的
+          # gh 版本里没生效，资产名仍是 GPP.ipa），先落到确定文件名再传。
+          cp "$IPA" "$RUNNER_TEMP/ios-${V}-${B}.ipa"
           gh release view builds -R "$PRIV" >/dev/null 2>&1 || \
             gh release create builds -R "$PRIV" --title "iOS builds" --notes "自动构建产物" >/dev/null
-          gh release upload builds -R "$PRIV" "$IPA#ios-${V}-${B}.ipa" --clobber
+          gh release upload builds -R "$PRIV" "$RUNNER_TEMP/ios-${V}-${B}.ipa" --clobber
           for D in "$RUNNER_TEMP"/out/*.dSYM.zip; do
             [ -f "$D" ] || continue
-            gh release upload builds -R "$PRIV" "$D#dSYM-${V}-${B}.zip" --clobber
+            cp "$D" "$RUNNER_TEMP/dSYM-${V}-${B}.zip"
+            gh release upload builds -R "$PRIV" "$RUNNER_TEMP/dSYM-${V}-${B}.zip" --clobber
           done
-          echo "产物已归档到私有仓库 builds Release"
+          # 早期版本误传的无版本名资产（GPP.ipa）没有意义，顺手清掉
+          gh release delete-asset builds "GPP.ipa" -R "$PRIV" --yes 2>/dev/null || true
+          echo "产物已归档到私有仓库 builds Release: ios-${V}-${B}.ipa"
 
       # ---------- 5. 分发 ----------
       # dev 证书打出的 Development IPA 只能装 profile 里注册的设备，不能上架。
