@@ -348,8 +348,13 @@ jobs:
             --entitlements ios-ci/GPP.entitlements
 
       - name: CocoaPods
+        env:
+          MASK: ${{ secrets.LOG_MASK }}
         run: |
           set -euo pipefail
+          # CocoaPods 会把每个 pod 的模块名和版本打进日志（含私有支付插件），
+          # 公开仓库的日志全球可见，先落盘、按 LOG_MASK 过滤后再输出。
+          [ -n "${MASK:-}" ] || MASK='zzz_no_mask_token'
           test -f "$SHELL_DIR/Podfile" || { echo "缺 Podfile"; exit 1; }
           cd "$SHELL_DIR"
           # Podfile 里 require_relative 'scripts/uniapp_module_config'，解压目录必须完整
@@ -357,7 +362,15 @@ jobs:
           # make-plugin-pod.py 精简为 CDN（见该脚本 3c），不再 clone git 仓库。
           # 旧写法 `|| pod install --repo-update` 一旦首次因别的原因失败，
           # 会静默触发全量 spec repo 更新，额外多花十几分钟且掩盖真实错误。
-          pod install --no-repo-update
+          set +e
+          pod install --no-repo-update 2>&1 | tee /tmp/pod.log | grep -vEi "$MASK"
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "--- pod install 失败（模块名已过滤）---"
+            grep -vEi "$MASK" /tmp/pod.log | tail -40
+            exit "$RC"
+          fi
           grep -q "Plugins/" Podfile.lock || {
             echo "::error::本地 path 引入的原生插件没进 Podfile.lock，不会链接进包"; exit 1; }
           # 5.26 工程没有 xcshareddata/xcschemes，Xcode 自动创建的 scheme 名 = target 名。
@@ -365,15 +378,14 @@ jobs:
           # 这里直接探测并覆盖 job env 里的 SCHEME。
           echo "--- 自动探测 scheme ---"
           xcodebuild -list -workspace HBuilder-Hello.xcworkspace -json > /tmp/schemes.json
-          # 实测 workspace 有 3 个 scheme：CPCNPayPlugin / HBuilder / Pods-HBuilder。
+          # workspace 里除 SDK target 外还有原生插件的 scheme 和 Pods-*，
           # 取第一个会误选插件 scheme（归档必失败），这里锁定 SDK target 名 HBuilder。
-          DETECTED=$(python3 -c "import json; d=json.load(open('/tmp/schemes.json')); s=((d.get('workspace') or d.get('project') or {}).get('schemes') or []); print('HBuilder' if 'HBuilder' in s else next((x for x in s if not x.startswith('Pods-') and not x.startswith('CPCN')), (s or [''])[0]))")
-          test -n "$DETECTED" || { echo "::error::xcodebuild -list 没列出 scheme"; cat /tmp/schemes.json; exit 1; }
-          test "$DETECTED" = "HBuilder" || {
-            echo "::error::没找到 HBuilder scheme，实际探测到: ${DETECTED}"; cat /tmp/schemes.json; exit 1; }
-          echo "检测到 scheme: ${DETECTED}（job env 默认 ${SCHEME}）"
+          DETECTED=$(python3 -c "import json; d=json.load(open('/tmp/schemes.json')); s=((d.get('workspace') or d.get('project') or {}).get('schemes') or []); print('HBuilder' if 'HBuilder' in s else '')")
+          test -n "$DETECTED" || {
+            echo "::error::xcodebuild -list 里没有 HBuilder scheme（scheme 清单含业务模块名，不打印）"; exit 1; }
+          echo "检测到 scheme: ${DETECTED}"
           echo "SCHEME=$DETECTED" >> "$GITHUB_ENV"
-          xcodebuild -list -workspace HBuilder-Hello.xcworkspace 2>/dev/null | head -30 || true
+          xcodebuild -list -workspace HBuilder-Hello.xcworkspace 2>/dev/null | grep -vEi "$MASK" | head -30 || true
 
       # ---------- 3. 签名凭据 ----------
       - name: 装入证书与描述文件
