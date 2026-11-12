@@ -337,6 +337,11 @@ jobs:
       - name: 集成原生插件与 Pod 模块
         run: |
           set -euo pipefail
+          # 模块清单以本次前端产物为准：manifest 新勾的模块在这里自动进 Podfile，
+          # 不再依赖有人记得回本地重跑准备脚本。
+          python3 ios-ci/apply-manifest-modules.py \
+            --manifest dist/app-plus/manifest.json \
+            --config ios-ci/app-config.json
           # 不在 workflow 里写插件目录名，避免公开第三方 SDK 的厂商信息；
           # 私有仓库 ios-ci/vendor/ 下按项目只有一个插件目录。
           VENDOR=$(ls -d ios-ci/vendor/*/ 2>/dev/null | head -n1)
