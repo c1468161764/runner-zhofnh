@@ -67,6 +67,9 @@ env:
   # 5.26 工程里没有共享 xcscheme，Xcode 自动创建的 scheme 名 = target 名
   # CocoaPods 步骤还会再自动探测一次并覆盖这里
   SCHEME: HBuilder
+  # ios-ci 下的脚本据此收敛输出：公开仓库的日志全球可见，只报「做了什么」，
+  # 不回显 AppID / 微信 AppID / URL Scheme / 插件名 / 域名等业务取值
+  GPP_CI_QUIET: "1"
 
 jobs:
   build:
@@ -439,6 +442,10 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
+          # xcodebuild 会把签名身份（"Apple Development: 姓名 (Team缩写)"）和
+          # TeamIdentifier 打进日志，公开仓库的日志全球可见，先落盘再过滤输出；
+          # 失败时也只回放过滤后的尾部，诊断信息足够但不含证书主体。
+          set +e
           xcodebuild archive \
             -workspace "$SHELL_DIR/HBuilder-Hello.xcworkspace" \
             -scheme "$SCHEME" \
@@ -446,7 +453,17 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
             MARKETING_VERSION="${{ steps.ver.outputs.version }}" \
-            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}"
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
+            2>&1 | tee "$RUNNER_TEMP/archive.log" \
+                 | grep -vE 'Apple Development:|Apple Distribution:|TeamIdentifier='
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "--- xcodebuild 失败（签名信息已过滤）---"
+            grep -vE 'Apple Development:|Apple Distribution:|TeamIdentifier=' \
+              "$RUNNER_TEMP/archive.log" | tail -60
+            exit "$RC"
+          fi
 
       - name: 导出 ipa
         run: |
